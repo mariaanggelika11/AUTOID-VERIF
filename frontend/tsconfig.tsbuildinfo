@@ -1,0 +1,1 @@
+{"root":["./src/main.tsx","./src/vite-env.d.ts","./src/components/barcodescanner.tsx","./src/components/facescanner.tsx","./src/components/ui/button.tsx","./src/components/ui/card.tsx","./src/hooks/usecamera.ts","./src/pages/home.tsx","./src/services/api.ts","./src/store/useappstore.ts","./src/utils/helpers.ts","./src/utils/pdf417scanner.ts"],"version":"5.9.3"}
