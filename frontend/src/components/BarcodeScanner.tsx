@@ -1,22 +1,17 @@
-import { BarcodeFormat, BrowserMultiFormatReader } from '@zxing/browser';
-import { DecodeHintType } from '@zxing/library';
 import { useEffect, useRef, useState } from 'react';
 import { submitBarcode } from '../services/api';
 import { useAppStore } from '../store/useAppStore';
 import { getErrorMessage } from '../utils/helpers';
-import { type ScannerSession, startPdf417Scanner } from '../utils/pdf417Scanner';
+import { createUploadPdf417Reader, type ScanResult, type ScannerSession, startPdf417Scanner } from '../utils/pdf417Scanner';
 import { Button } from './ui/Button';
-
-const uploadHints = new Map<DecodeHintType, unknown>([
-  [DecodeHintType.POSSIBLE_FORMATS, [BarcodeFormat.PDF_417]],
-  [DecodeHintType.TRY_HARDER, true]
-]);
 
 export default function BarcodeScanner() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const sessionRef = useRef<ScannerSession | null>(null);
   const submittingRef = useRef(false);
+  const uploadReaderRef = useRef(createUploadPdf417Reader());
   const setLicense = useAppStore((state) => state.setLicense);
+  const barcodeCaptureImage = useAppStore((state) => state.barcodeCaptureImage);
   const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
   const [deviceId, setDeviceId] = useState<string>();
   const [scanning, setScanning] = useState(false);
@@ -27,13 +22,25 @@ export default function BarcodeScanner() {
   const [attempts, setAttempts] = useState(0);
   const [error, setError] = useState('');
   const [status, setStatus] = useState('Opening camera...');
+  const [capturedPreview, setCapturedPreview] = useState('');
   const [manualRaw, setManualRaw] = useState('');
 
+  function readFileAsDataUrl(file: File) {
+    return new Promise<string>((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(typeof reader.result === 'string' ? reader.result : '');
+      reader.onerror = () => reject(new Error('Failed to read the uploaded image.'));
+      reader.readAsDataURL(file);
+    });
+  }
+
   useEffect(() => {
-    BrowserMultiFormatReader.listVideoInputDevices()
+    navigator.mediaDevices
+      .enumerateDevices()
       .then((items) => {
-        setDevices(items);
-        setDeviceId((current) => current ?? items.find((item) => /back|rear|environment/i.test(item.label))?.deviceId ?? items[0]?.deviceId);
+        const cameras = items.filter((item): item is MediaDeviceInfo => item.kind === 'videoinput');
+        setDevices(cameras);
+        setDeviceId((current) => current ?? cameras.find((item) => /back|rear|environment/i.test(item.label))?.deviceId ?? cameras[0]?.deviceId);
         setCameraListReady(true);
       })
       .catch(() => setCameraListReady(true));
@@ -52,13 +59,19 @@ export default function BarcodeScanner() {
       setError('');
       setAttempts(0);
       setTorchEnabled(false);
-      setStatus('Opening HD camera...');
+      setCapturedPreview(barcodeCaptureImage);
+      setStatus('Opening camera...');
 
       try {
         const session = await startPdf417Scanner({
           video: videoRef.current,
           deviceId,
-          onResult: (raw) => void handleBarcode(raw),
+          onCapture: (captureImage) => {
+            setScanning(false);
+            setCapturedPreview(captureImage);
+            setStatus('Preview captured. Parsing barcode...');
+          },
+          onResult: (result) => void handleBarcode(result),
           onError: (message) => setError(message),
           onQuality: (quality) => {
             setAttempts(quality.attempts);
@@ -73,7 +86,7 @@ export default function BarcodeScanner() {
 
         sessionRef.current = session;
         setTorchSupported(session.torchSupported);
-        setStatus('Move closer');
+        setStatus('Place the full Driver License inside the box.');
       } catch (err) {
         if (cancelled) return;
 
@@ -90,21 +103,22 @@ export default function BarcodeScanner() {
       sessionRef.current?.stop();
       sessionRef.current = null;
     };
-  }, [cameraListReady, deviceId, restartKey]);
+  }, [barcodeCaptureImage, cameraListReady, deviceId, restartKey]);
 
-  async function handleBarcode(raw: string) {
+  async function handleBarcode(result: ScanResult) {
     if (submittingRef.current) return;
     submittingRef.current = true;
 
     try {
-      setStatus('PDF417 detected. Parsing AAMVA data...');
-      const license = await submitBarcode(raw);
-      sessionRef.current?.stop();
+      setCapturedPreview(result.captureImage);
       setScanning(false);
-      setLicense(license, raw);
+      setStatus('Parsing AAMVA data...');
+      const license = await submitBarcode(result.raw);
+      sessionRef.current?.stop();
+      setLicense(license, result.raw, result.captureImage);
     } catch (err) {
       setError(getErrorMessage(err));
-      setStatus('Invalid format');
+      setStatus('Captured, but parsing failed.');
       setScanning(false);
     } finally {
       submittingRef.current = false;
@@ -112,6 +126,7 @@ export default function BarcodeScanner() {
   }
 
   function retry() {
+    setCapturedPreview('');
     setRestartKey((current) => current + 1);
   }
 
@@ -125,14 +140,16 @@ export default function BarcodeScanner() {
     if (!file) return;
 
     setError('');
-    setStatus('Reading PDF417 from uploaded image...');
+    setCapturedPreview('');
+    setStatus('Reading barcode from uploaded image...');
 
-    const reader = new BrowserMultiFormatReader(uploadHints);
     const url = URL.createObjectURL(file);
 
     try {
-      const result = await reader.decodeFromImageUrl(url);
-      await handleBarcode(result.getText());
+      const preview = await readFileAsDataUrl(file);
+      setCapturedPreview(preview);
+      const result = await uploadReaderRef.current.decodeFromImageUrl(url);
+      await handleBarcode({ raw: result.getText(), captureImage: preview });
     } catch (err) {
       setError(`Barcode not found. ${getErrorMessage(err)}`);
       setStatus('');
@@ -148,7 +165,7 @@ export default function BarcodeScanner() {
       return;
     }
 
-    await handleBarcode(manualRaw.trim());
+    await handleBarcode({ raw: manualRaw.trim(), captureImage: '' });
   }
 
   return (
@@ -156,12 +173,22 @@ export default function BarcodeScanner() {
       <div className="relative overflow-hidden rounded-md bg-gray-100">
         <video ref={videoRef} className="aspect-video w-full object-cover" muted playsInline />
         <div className="pointer-events-none absolute inset-0 bg-black/20">
-          <div className="absolute left-1/2 top-1/2 h-[42%] w-[82%] -translate-x-1/2 -translate-y-1/2 rounded-md border-2 border-white shadow-[0_0_0_999px_rgba(0,0,0,0.35)]" />
+          <div className="absolute left-1/2 top-1/2 h-[78%] w-[96%] -translate-x-1/2 -translate-y-1/2 rounded-md border-2 border-white shadow-[0_0_0_999px_rgba(0,0,0,0.3)]" />
+          <p className="absolute left-1/2 top-[14%] -translate-x-1/2 rounded-full bg-black/60 px-3 py-1 text-xs font-medium text-white">
+            Keep the full card inside the box
+          </p>
         </div>
         <div className="absolute bottom-3 left-3 rounded-md bg-white px-3 py-2 text-sm font-medium text-gray-950">
           {status || 'Scanning PDF417'}
         </div>
       </div>
+
+      {capturedPreview && (
+        <div className="rounded-md border border-gray-200 p-3">
+          <p className="mb-2 text-sm font-medium text-gray-700">Captured barcode preview</p>
+          <img src={capturedPreview} alt="Captured barcode preview" className="max-h-56 w-full rounded-md object-contain" />
+        </div>
+      )}
 
       <div className="grid gap-3 sm:grid-cols-[1fr_auto]">
         {devices.length > 0 && (
@@ -192,6 +219,7 @@ export default function BarcodeScanner() {
         <p>Status: {status || '-'}</p>
         <p>Attempts: {attempts}</p>
         <p>Scanner: {scanning ? 'Active' : 'Stopped'}</p>
+        <p>Flow: Capture first, then parse</p>
       </div>
 
       {error && (

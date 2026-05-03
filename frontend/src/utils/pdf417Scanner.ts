@@ -8,12 +8,28 @@ export type ScanQuality = {
   message: string;
 };
 
+export type ScanResult = {
+  raw: string;
+  captureImage: string;
+};
+
 type ScannerOptions = {
   video: HTMLVideoElement;
   deviceId?: string;
-  onResult: (raw: string) => void;
+  onCapture?: (captureImage: string) => void;
+  onResult: (result: ScanResult) => void;
   onQuality: (quality: ScanQuality) => void;
   onError: (message: string) => void;
+};
+
+type FrameMetrics = {
+  brightness: number;
+  blurScore: number;
+};
+
+type FrameVariant = {
+  canvas: HTMLCanvasElement;
+  captureImage: string;
 };
 
 export type ScannerSession = {
@@ -22,22 +38,27 @@ export type ScannerSession = {
   torchSupported: boolean;
 };
 
-const SCAN_INTERVAL_MS = 400;
-const MIN_FAIL_ATTEMPTS = 10;
-const ROI_WIDTH_RATIO = 0.82;
-const ROI_HEIGHT_RATIO = 0.42;
+const SCAN_INTERVAL_MS = 120;
+const ROI_WIDTH_RATIO = 0.94;
+const ROI_HEIGHT_RATIO = 0.76;
+const CAPTURE_SCALE = 1.4;
+const MIN_STEADY_BLUR_SCORE = 6;
+const MAX_COMFORT_BRIGHTNESS = 225;
+const MIN_FAIL_ATTEMPTS = 6;
 
 const hints = new Map<DecodeHintType, unknown>([
-  [DecodeHintType.POSSIBLE_FORMATS, [BarcodeFormat.PDF_417]],
-  [DecodeHintType.TRY_HARDER, true]
+  [DecodeHintType.POSSIBLE_FORMATS, [BarcodeFormat.PDF_417]]
 ]);
 
-const reader = new BrowserMultiFormatReader(hints);
+const reader = new BrowserMultiFormatReader(hints) as BrowserMultiFormatReader & {
+  timeBetweenDecodingAttempts?: number;
+};
+reader.timeBetweenDecodingAttempts = SCAN_INTERVAL_MS;
 
 function getCameraConstraints(deviceId?: string): MediaStreamConstraints {
   const video: MediaTrackConstraints = {
-    width: { min: 1280, ideal: 1920 },
-    height: { min: 720, ideal: 1080 },
+    width: { ideal: 1280 },
+    height: { ideal: 720 },
     facingMode: { ideal: 'environment' }
   };
 
@@ -45,10 +66,7 @@ function getCameraConstraints(deviceId?: string): MediaStreamConstraints {
     video.deviceId = { exact: deviceId };
   }
 
-  return {
-    audio: false,
-    video
-  };
+  return { audio: false, video };
 }
 
 async function applyCameraControls(stream: MediaStream) {
@@ -66,129 +84,195 @@ async function applyCameraControls(stream: MediaStream) {
   await track.applyConstraints(constraints).catch(() => undefined);
 }
 
+function createCanvas(width: number, height: number) {
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.max(1, Math.round(width));
+  canvas.height = Math.max(1, Math.round(height));
+  return canvas;
+}
+
 function getRoi(video: HTMLVideoElement) {
   const width = Math.round(video.videoWidth * ROI_WIDTH_RATIO);
   const height = Math.round(video.videoHeight * ROI_HEIGHT_RATIO);
   const x = Math.round((video.videoWidth - width) / 2);
   const y = Math.round((video.videoHeight - height) / 2);
-
   return { x, y, width, height };
 }
 
-function getAverageBrightness(gray: Uint8ClampedArray) {
-  let sum = 0;
-  for (let index = 0; index < gray.length; index += 1) sum += gray[index];
-  return sum / gray.length;
+function captureFrame(video: HTMLVideoElement) {
+  const roi = getRoi(video);
+  const canvas = createCanvas(roi.width * CAPTURE_SCALE, roi.height * CAPTURE_SCALE);
+  const context = canvas.getContext('2d');
+  if (!context) throw new Error('Canvas context is not available.');
+
+  context.imageSmoothingEnabled = true;
+  context.imageSmoothingQuality = 'high';
+  context.drawImage(video, roi.x, roi.y, roi.width, roi.height, 0, 0, canvas.width, canvas.height);
+  return canvas;
 }
 
-function getBlurScore(gray: Uint8ClampedArray, width: number, height: number) {
-  let total = 0;
-  let totalSquared = 0;
-  let count = 0;
+function cropCanvas(source: HTMLCanvasElement, xRatio: number, yRatio: number, widthRatio: number, heightRatio: number) {
+  const sx = Math.max(0, Math.round(source.width * xRatio));
+  const sy = Math.max(0, Math.round(source.height * yRatio));
+  const sw = Math.max(1, Math.min(source.width - sx, Math.round(source.width * widthRatio)));
+  const sh = Math.max(1, Math.min(source.height - sy, Math.round(source.height * heightRatio)));
+  const canvas = createCanvas(sw, sh);
+  const context = canvas.getContext('2d');
+  if (!context) throw new Error('Canvas context is not available.');
 
-  for (let y = 1; y < height - 1; y += 4) {
-    for (let x = 1; x < width - 1; x += 4) {
-      const index = y * width + x;
-      const laplacian =
-        gray[index - width] +
-        gray[index - 1] -
-        gray[index] * 4 +
-        gray[index + 1] +
-        gray[index + width];
+  context.drawImage(source, sx, sy, sw, sh, 0, 0, sw, sh);
+  return canvas;
+}
 
-      total += laplacian;
-      totalSquared += laplacian * laplacian;
-      count += 1;
+function captureMetrics(source: HTMLCanvasElement) {
+  const context = source.getContext('2d', { willReadFrequently: true });
+  if (!context) throw new Error('Canvas context is not available.');
+
+  const step = 4;
+  const image = context.getImageData(0, 0, source.width, source.height);
+  const { data } = image;
+  const width = source.width;
+  const height = source.height;
+  let brightnessTotal = 0;
+  let brightnessCount = 0;
+  let laplacianTotal = 0;
+  let laplacianSquared = 0;
+  let laplacianCount = 0;
+
+  for (let y = 0; y < height; y += step) {
+    for (let x = 0; x < width; x += step) {
+      const index = (y * width + x) * 4;
+      const value = data[index] * 0.299 + data[index + 1] * 0.587 + data[index + 2] * 0.114;
+      brightnessTotal += value;
+      brightnessCount += 1;
+
+      if (x < step || y < step || x >= width - step || y >= height - step) continue;
+
+      const up = ((y - step) * width + x) * 4;
+      const down = ((y + step) * width + x) * 4;
+      const left = (y * width + (x - step)) * 4;
+      const right = (y * width + (x + step)) * 4;
+      const upGray = data[up] * 0.299 + data[up + 1] * 0.587 + data[up + 2] * 0.114;
+      const downGray = data[down] * 0.299 + data[down + 1] * 0.587 + data[down + 2] * 0.114;
+      const leftGray = data[left] * 0.299 + data[left + 1] * 0.587 + data[left + 2] * 0.114;
+      const rightGray = data[right] * 0.299 + data[right + 1] * 0.587 + data[right + 2] * 0.114;
+      const laplacian = upGray + leftGray - value * 4 + rightGray + downGray;
+
+      laplacianTotal += laplacian;
+      laplacianSquared += laplacian * laplacian;
+      laplacianCount += 1;
     }
   }
 
-  if (!count) return 0;
-  const mean = total / count;
-  return totalSquared / count - mean * mean;
+  const brightness = brightnessCount ? brightnessTotal / brightnessCount : 0;
+  const mean = laplacianCount ? laplacianTotal / laplacianCount : 0;
+  const blurScore = laplacianCount ? laplacianSquared / laplacianCount - mean * mean : 0;
+
+  return { brightness, blurScore };
 }
 
-function preprocess(source: HTMLCanvasElement, adaptiveThreshold = false) {
+function applyGrayscaleContrast(source: HTMLCanvasElement) {
   const context = source.getContext('2d', { willReadFrequently: true });
   if (!context) throw new Error('Canvas context is not available.');
 
   const image = context.getImageData(0, 0, source.width, source.height);
   const { data } = image;
-  const gray = new Uint8ClampedArray(source.width * source.height);
+  const contrast = 1.4;
 
-  for (let index = 0, pixel = 0; index < data.length; index += 4, pixel += 1) {
-    gray[pixel] = data[index] * 0.299 + data[index + 1] * 0.587 + data[index + 2] * 0.114;
-  }
-
-  const brightness = getAverageBrightness(gray);
-  const blurScore = getBlurScore(gray, source.width, source.height);
-  const enhanced = new Uint8ClampedArray(gray.length);
-  const contrast = 1.45;
-
-  for (let y = 0; y < source.height; y += 1) {
-    for (let x = 0; x < source.width; x += 1) {
-      const index = y * source.width + x;
-      const center = gray[index];
-      const left = gray[index - 1] ?? center;
-      const right = gray[index + 1] ?? center;
-      const top = gray[index - source.width] ?? center;
-      const bottom = gray[index + source.width] ?? center;
-      const sharpened = center * 1.8 - (left + right + top + bottom) * 0.2;
-      const contrasted = (sharpened - 128) * contrast + 128;
-      enhanced[index] = Math.max(0, Math.min(255, contrasted));
-    }
-  }
-
-  for (let index = 0, pixel = 0; index < data.length; index += 4, pixel += 1) {
-    const value = adaptiveThreshold ? (enhanced[pixel] > brightness * 0.92 ? 255 : 0) : enhanced[pixel];
+  for (let index = 0; index < data.length; index += 4) {
+    const gray = data[index] * 0.299 + data[index + 1] * 0.587 + data[index + 2] * 0.114;
+    const value = Math.max(0, Math.min(255, (gray - 128) * contrast + 128));
     data[index] = value;
     data[index + 1] = value;
     data[index + 2] = value;
   }
 
   context.putImageData(image, 0, 0);
-  return { brightness, blurScore };
 }
 
-function getQualityMessage(attempts: number, brightness: number, blurScore: number, error: unknown) {
-  if (brightness < 65) return 'Low light detected';
-  if (blurScore < 90) return 'Hold steady';
-
-  if (error instanceof ChecksumException) {
-    return 'Hold steady';
-  }
-
-  if (error instanceof FormatException) {
-    return 'Barcode is visible but not valid PDF417';
-  }
-
-  if (attempts >= MIN_FAIL_ATTEMPTS) {
-    return 'Barcode not found';
-  }
-
-  return 'Move closer';
-}
-
-function drawRoiToCanvas(video: HTMLVideoElement, canvas: HTMLCanvasElement) {
-  const roi = getRoi(video);
-  const targetWidth = Math.min(1100, roi.width);
-  const targetHeight = Math.round((targetWidth / roi.width) * roi.height);
-  const context = canvas.getContext('2d', { willReadFrequently: true });
-  if (!context) throw new Error('Canvas context is not available.');
-
-  canvas.width = targetWidth;
-  canvas.height = targetHeight;
-  context.drawImage(video, roi.x, roi.y, roi.width, roi.height, 0, 0, targetWidth, targetHeight);
+function getQualityMessage(attempts: number, metrics: FrameMetrics, error?: unknown) {
+  if (metrics.brightness < 55) return 'The image is too dark. Move to brighter light or turn on the torch.';
+  if (metrics.brightness > MAX_COMFORT_BRIGHTNESS) return 'The image is too bright or has glare. Tilt the card slightly or reduce direct light.';
+  if (metrics.blurScore < MIN_STEADY_BLUR_SCORE) return 'The card is a bit blurry. Hold it steady for a moment.';
+  if (error instanceof ChecksumException) return 'Barcode is visible. Hold the card steady for a moment.';
+  if (error instanceof FormatException) return 'Barcode is partly visible. Keep the full card inside the box.';
+  if (attempts >= MIN_FAIL_ATTEMPTS) return 'Keep the full Driver License inside the box and make sure the barcode stays visible.';
+  return 'Place the full Driver License inside the box.';
 }
 
 function isAamva(raw: string) {
   return raw.includes('ANSI') || raw.includes('AAMVA');
 }
 
+function buildFrameVariants(frame: HTMLCanvasElement): FrameVariant[] {
+  const fullFrame = cropCanvas(frame, 0, 0, 1, 1);
+  const barcodeBand = cropCanvas(frame, 0.02, 0.56, 0.96, 0.24);
+  const widerBarcodeBand = cropCanvas(frame, 0, 0.5, 1, 0.3);
+  return [
+    {
+      canvas: fullFrame,
+      captureImage: fullFrame.toDataURL('image/jpeg', 0.84)
+    },
+    {
+      canvas: barcodeBand,
+      captureImage: barcodeBand.toDataURL('image/jpeg', 0.88)
+    },
+    {
+      canvas: widerBarcodeBand,
+      captureImage: widerBarcodeBand.toDataURL('image/jpeg', 0.86)
+    }
+  ];
+}
+
+function decodeCanvas(canvas: HTMLCanvasElement) {
+  return reader.decodeFromCanvas(canvas).getText();
+}
+
+function decodeVariant(variant: FrameVariant) {
+  try {
+    return {
+      raw: decodeCanvas(variant.canvas),
+      captureImage: variant.captureImage
+    };
+  } catch (error) {
+    if (!(error instanceof NotFoundException)) throw error;
+  }
+
+  applyGrayscaleContrast(variant.canvas);
+  return {
+    raw: decodeCanvas(variant.canvas),
+    captureImage: variant.captureImage
+  };
+}
+
+function decodeFrame(frame: HTMLCanvasElement) {
+  let lastError: unknown = new NotFoundException();
+
+  for (const variant of buildFrameVariants(frame)) {
+    try {
+      return decodeVariant(variant);
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  throw lastError;
+}
+
+export function createUploadPdf417Reader() {
+  return new BrowserMultiFormatReader(
+    new Map<DecodeHintType, unknown>([
+      [DecodeHintType.POSSIBLE_FORMATS, [BarcodeFormat.PDF_417]],
+      [DecodeHintType.TRY_HARDER, true]
+    ])
+  );
+}
+
 export async function startPdf417Scanner(options: ScannerOptions): Promise<ScannerSession> {
   const stream = await navigator.mediaDevices.getUserMedia(getCameraConstraints(options.deviceId));
+
   try {
     await applyCameraControls(stream);
-
     options.video.srcObject = stream;
     options.video.muted = true;
     options.video.playsInline = true;
@@ -201,51 +285,67 @@ export async function startPdf417Scanner(options: ScannerOptions): Promise<Scann
 
   const [track] = stream.getVideoTracks();
   const torchSupported = Boolean(track && BrowserCodeReader.mediaStreamIsTorchCompatibleTrack(track));
-  const canvas = document.createElement('canvas');
   let stopped = false;
+  let completed = false;
   let attempts = 0;
 
+  const stop = () => {
+    if (stopped) return;
+    stopped = true;
+    window.clearInterval(intervalId);
+    stream.getTracks().forEach((item) => item.stop());
+    BrowserCodeReader.cleanVideoSource(options.video);
+  };
+
+  const finish = (decoded: ScanResult, metrics: FrameMetrics) => {
+    completed = true;
+    stop();
+    options.onCapture?.(decoded.captureImage);
+    options.onQuality({
+      attempts,
+      brightness: metrics.brightness,
+      blurScore: metrics.blurScore,
+      message: 'Parsing barcode...'
+    });
+    options.onResult(decoded);
+  };
+
   const scanOnce = () => {
-    if (stopped || options.video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return;
+    if (stopped || completed || options.video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return;
 
     attempts += 1;
-    let brightness = 0;
-    let blurScore = 0;
 
     try {
-      drawRoiToCanvas(options.video, canvas);
-      const quality = preprocess(canvas);
-      brightness = quality.brightness;
-      blurScore = quality.blurScore;
+      const frame = captureFrame(options.video);
+      const metrics = captureMetrics(frame);
+      options.onQuality({
+        attempts,
+        brightness: metrics.brightness,
+        blurScore: metrics.blurScore,
+        message: attempts <= 2 ? 'Scanning barcode...' : getQualityMessage(attempts, metrics)
+      });
 
-      let result;
-      try {
-        result = reader.decodeFromCanvas(canvas);
-      } catch (firstError) {
-        if (firstError instanceof NotFoundException && attempts >= 3) {
-          preprocess(canvas, true);
-          result = reader.decodeFromCanvas(canvas);
-        } else {
-          throw firstError;
-        }
-      }
+      const decoded = decodeFrame(frame);
 
-      const raw = result.getText();
-      if (!isAamva(raw)) {
-        options.onError('Barcode is not a US Driver License');
-        options.onQuality({ attempts, brightness, blurScore, message: 'Barcode is not a US Driver License' });
+      if (!isAamva(decoded.raw)) {
+        options.onError('Detected barcode is not a valid AAMVA PDF417 barcode.');
+        options.onQuality({
+          attempts,
+          brightness: metrics.brightness,
+          blurScore: metrics.blurScore,
+          message: 'Barcode was detected, but it is not a valid Driver License PDF417.'
+        });
         return;
       }
 
-      stopped = true;
-      options.onQuality({ attempts, brightness, blurScore, message: 'PDF417 detected' });
-      options.onResult(raw);
+      finish(decoded, metrics);
     } catch (error) {
+      const metrics = { brightness: 0, blurScore: 0 };
       options.onQuality({
         attempts,
-        brightness,
-        blurScore,
-        message: getQualityMessage(attempts, brightness, blurScore, error)
+        brightness: metrics.brightness,
+        blurScore: metrics.blurScore,
+        message: getQualityMessage(attempts, metrics, error)
       });
     }
   };
@@ -254,12 +354,7 @@ export async function startPdf417Scanner(options: ScannerOptions): Promise<Scann
 
   return {
     torchSupported,
-    stop: () => {
-      stopped = true;
-      window.clearInterval(intervalId);
-      stream.getTracks().forEach((item) => item.stop());
-      BrowserCodeReader.cleanVideoSource(options.video);
-    },
+    stop,
     setTorch: async (enabled: boolean) => {
       if (!track || !torchSupported) return;
       await BrowserCodeReader.mediaStreamSetTorch(track, enabled);
