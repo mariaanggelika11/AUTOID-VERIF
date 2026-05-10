@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { submitBarcode } from '../services/api';
 import { useAppStore } from '../store/useAppStore';
 import { getErrorMessage } from '../utils/helpers';
-import { createUploadPdf417Reader, type ScanResult, type ScannerSession, startPdf417Scanner } from '../utils/pdf417Scanner';
+import { capturePdf417Attempt, createUploadPdf417Reader, type ScanResult, type ScannerSession, startPdf417Scanner } from '../utils/pdf417Scanner';
 import { Button } from './ui/Button';
 
 export default function BarcodeScanner() {
@@ -127,6 +127,8 @@ export default function BarcodeScanner() {
 
   function retry() {
     setCapturedPreview('');
+    setError('');
+    setStatus('Opening camera...');
     setRestartKey((current) => current + 1);
   }
 
@@ -168,6 +170,26 @@ export default function BarcodeScanner() {
     await handleBarcode({ raw: manualRaw.trim(), captureImage: '' });
   }
 
+  async function captureBarcodeManually() {
+    if (!videoRef.current || submittingRef.current) return;
+
+    const attempt = capturePdf417Attempt(videoRef.current);
+    sessionRef.current?.stop();
+    sessionRef.current = null;
+    setScanning(false);
+    setError('');
+    setStatus('Preview captured. Parsing barcode...');
+
+    if (!attempt.ok) {
+      setCapturedPreview(attempt.error.captureImage);
+      setStatus('Manual capture failed.');
+      setError(attempt.error.message);
+      return;
+    }
+
+    await handleBarcode(attempt.result);
+  }
+
   return (
     <div className="space-y-4">
       <div className="relative overflow-hidden rounded-md bg-gray-100">
@@ -190,7 +212,7 @@ export default function BarcodeScanner() {
         </div>
       )}
 
-      <div className="grid gap-3 sm:grid-cols-[1fr_auto]">
+      <div className="grid gap-3 sm:grid-cols-[1fr_auto_auto]">
         {devices.length > 0 && (
           <label className="block text-sm font-medium text-gray-700">
             Camera
@@ -213,6 +235,10 @@ export default function BarcodeScanner() {
             {torchEnabled ? 'Torch Off' : 'Torch On'}
           </Button>
         )}
+
+        <Button type="button" onClick={() => void captureBarcodeManually()} className="self-end">
+          Manual Capture
+        </Button>
       </div>
 
       <div className="rounded-md border border-gray-200 p-3 text-sm text-gray-700">
@@ -226,7 +252,7 @@ export default function BarcodeScanner() {
         <div className="space-y-3 rounded-md border border-red-200 bg-red-50 p-3">
           <p className="text-sm font-medium text-red-700">{error}</p>
           <Button type="button" onClick={retry}>
-            Retry Scan
+            Capture Again
           </Button>
         </div>
       )}

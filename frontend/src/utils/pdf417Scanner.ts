@@ -13,6 +13,11 @@ export type ScanResult = {
   captureImage: string;
 };
 
+export type ManualCaptureError = {
+  message: string;
+  captureImage: string;
+};
+
 type ScannerOptions = {
   video: HTMLVideoElement;
   deviceId?: string;
@@ -259,6 +264,35 @@ function decodeFrame(frame: HTMLCanvasElement) {
   throw lastError;
 }
 
+function buildManualCaptureError(frame: HTMLCanvasElement, error: unknown): ManualCaptureError {
+  const metrics = captureMetrics(frame);
+  const fallbackMessage = getQualityMessage(MIN_FAIL_ATTEMPTS, metrics, error);
+  let detail = 'Detected barcode could not be read correctly.';
+
+  if (error instanceof ChecksumException || error instanceof FormatException || error instanceof NotFoundException) {
+    detail = fallbackMessage;
+  } else if (error instanceof Error && error.name === 'InvalidAamvaBarcodeError') {
+    detail = 'Barcode was detected, but it is not a valid Driver License PDF417.';
+  }
+
+  return {
+    message: `Manual capture failed. ${detail} Press "Capture Again" to retry.`,
+    captureImage: frame.toDataURL('image/jpeg', 0.84)
+  };
+}
+
+function decodeCapturedFrame(frame: HTMLCanvasElement): ScanResult {
+  const decoded = decodeFrame(frame);
+
+  if (!isAamva(decoded.raw)) {
+    const error = new Error('Detected barcode is not a valid AAMVA PDF417 barcode.');
+    error.name = 'InvalidAamvaBarcodeError';
+    throw error;
+  }
+
+  return decoded;
+}
+
 export function createUploadPdf417Reader() {
   return new BrowserMultiFormatReader(
     new Map<DecodeHintType, unknown>([
@@ -266,6 +300,22 @@ export function createUploadPdf417Reader() {
       [DecodeHintType.TRY_HARDER, true]
     ])
   );
+}
+
+export function capturePdf417Attempt(video: HTMLVideoElement) {
+  const frame = captureFrame(video);
+
+  try {
+    return {
+      ok: true as const,
+      result: decodeCapturedFrame(frame)
+    };
+  } catch (error) {
+    return {
+      ok: false as const,
+      error: buildManualCaptureError(frame, error)
+    };
+  }
 }
 
 export async function startPdf417Scanner(options: ScannerOptions): Promise<ScannerSession> {
