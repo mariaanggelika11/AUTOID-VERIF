@@ -2,14 +2,26 @@ import { useEffect, useRef, useState } from 'react';
 import { submitBarcode } from '../services/api';
 import { useAppStore } from '../store/useAppStore';
 import { getErrorMessage } from '../utils/helpers';
-import { capturePdf417Attempt, createUploadPdf417Reader, type ScanResult, type ScannerSession, startPdf417Scanner } from '../utils/pdf417Scanner';
+import {
+  capturePdf417AttemptFromBurstWithLockedPreview,
+  capturePdf417HighResStill,
+  capturePdf417Preview,
+  capturePdf417UiPreview,
+  createUploadPdf417Reader,
+  decodeCapturedFrameHybrid,
+  type ScanResult,
+  type ScannerSession,
+  startPdf417Scanner
+} from '../utils/pdf417Scanner';
 import { Button } from './ui/Button';
 
 export default function BarcodeScanner() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const sessionRef = useRef<ScannerSession | null>(null);
   const submittingRef = useRef(false);
-  const uploadReaderRef = useRef(createUploadPdf417Reader());
+  const lastQualityUiUpdateRef = useRef(0);
+  const cameraPickerActiveRef = useRef(false);
+  const cameraSwitchingRef = useRef(false);
   const setLicense = useAppStore((state) => state.setLicense);
   const barcodeCaptureImage = useAppStore((state) => state.barcodeCaptureImage);
   const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
@@ -22,8 +34,15 @@ export default function BarcodeScanner() {
   const [attempts, setAttempts] = useState(0);
   const [error, setError] = useState('');
   const [status, setStatus] = useState('Opening camera...');
-  const [capturedPreview, setCapturedPreview] = useState('');
+  const [capturedPreview, setCapturedPreview] = useState(() => barcodeCaptureImage);
+  const [manualCapturing, setManualCapturing] = useState(false);
   const [manualRaw, setManualRaw] = useState('');
+
+  function waitForNextPaint() {
+    return new Promise<void>((resolve) => {
+      window.requestAnimationFrame(() => resolve());
+    });
+  }
 
   function readFileAsDataUrl(file: File) {
     return new Promise<string>((resolve, reject) => {
@@ -59,8 +78,11 @@ export default function BarcodeScanner() {
       setError('');
       setAttempts(0);
       setTorchEnabled(false);
-      setCapturedPreview(barcodeCaptureImage);
+      setManualCapturing(false);
       setStatus('Opening camera...');
+      lastQualityUiUpdateRef.current = 0;
+      cameraPickerActiveRef.current = false;
+      cameraSwitchingRef.current = false;
 
       try {
         const session = await startPdf417Scanner({
@@ -74,6 +96,15 @@ export default function BarcodeScanner() {
           onResult: (result) => void handleBarcode(result),
           onError: (message) => setError(message),
           onQuality: (quality) => {
+            const now = Date.now();
+            const shouldRefreshUi =
+              quality.message === 'Parsing barcode...' ||
+              quality.attempts <= 2 ||
+              now - lastQualityUiUpdateRef.current >= 350;
+
+            if (!shouldRefreshUi) return;
+
+            lastQualityUiUpdateRef.current = now;
             setAttempts(quality.attempts);
             setStatus(quality.message);
           }
@@ -103,7 +134,7 @@ export default function BarcodeScanner() {
       sessionRef.current?.stop();
       sessionRef.current = null;
     };
-  }, [barcodeCaptureImage, cameraListReady, deviceId, restartKey]);
+  }, [cameraListReady, deviceId, restartKey]);
 
   async function handleBarcode(result: ScanResult) {
     if (submittingRef.current) return;
@@ -138,6 +169,31 @@ export default function BarcodeScanner() {
     setTorchEnabled(next);
   }
 
+  function pauseScannerForCameraPicker() {
+    if (cameraPickerActiveRef.current || manualCapturing || !sessionRef.current) return;
+    cameraPickerActiveRef.current = true;
+    sessionRef.current.pause();
+    setScanning(false);
+    setStatus('Choose a camera...');
+  }
+
+  function resumeScannerAfterCameraPicker() {
+    if (!cameraPickerActiveRef.current) return;
+    cameraPickerActiveRef.current = false;
+    if (cameraSwitchingRef.current) return;
+    if (!sessionRef.current || manualCapturing) return;
+    sessionRef.current.resume();
+    setScanning(true);
+    setStatus('Place the full Driver License inside the box.');
+  }
+
+  function handleCameraChange(nextDeviceId: string) {
+    cameraSwitchingRef.current = true;
+    setScanning(false);
+    setStatus('Opening camera...');
+    setDeviceId(nextDeviceId);
+  }
+
   async function scanUploadedImage(file: File | undefined) {
     if (!file) return;
 
@@ -150,7 +206,7 @@ export default function BarcodeScanner() {
     try {
       const preview = await readFileAsDataUrl(file);
       setCapturedPreview(preview);
-      const result = await uploadReaderRef.current.decodeFromImageUrl(url);
+      const result = await createUploadPdf417Reader().decodeFromImageUrl(url);
       await handleBarcode({ raw: result.getText(), captureImage: preview });
     } catch (err) {
       setError(`Barcode not found. ${getErrorMessage(err)}`);
@@ -171,32 +227,52 @@ export default function BarcodeScanner() {
   }
 
   async function captureBarcodeManually() {
-    if (!videoRef.current || submittingRef.current) return;
+    if (!videoRef.current || submittingRef.current || manualCapturing) return;
 
-    const attempt = capturePdf417Attempt(videoRef.current);
-    sessionRef.current?.stop();
-    sessionRef.current = null;
+    setManualCapturing(true);
+    sessionRef.current?.pause();
+    const lockedPreviewImage = capturePdf417UiPreview(videoRef.current);
+    setCapturedPreview(lockedPreviewImage);
     setScanning(false);
     setError('');
-    setStatus('Preview captured. Parsing barcode...');
+    setStatus('Preview captured. Preparing barcode...');
+    try {
+      await waitForNextPaint();
+      const stillCapture = await capturePdf417HighResStill(videoRef.current);
+      const initialCapture = stillCapture ?? capturePdf417Preview(videoRef.current, false);
+      sessionRef.current?.stop();
+      sessionRef.current = null;
 
-    if (!attempt.ok) {
-      setCapturedPreview(attempt.error.captureImage);
-      setStatus('Manual capture failed.');
-      setError(attempt.error.message);
-      return;
+      const attempt = await decodeCapturedFrameHybrid(initialCapture, 'manual', true)
+        .then((result) => ({
+          ok: true as const,
+          result: {
+            ...result.decoded,
+            captureImage: lockedPreviewImage
+          }
+        }))
+        .catch(() => capturePdf417AttemptFromBurstWithLockedPreview([initialCapture], lockedPreviewImage));
+
+      if (!attempt.ok) {
+        setCapturedPreview(attempt.error.captureImage);
+        setStatus('Manual capture failed.');
+        setError(attempt.error.message);
+        return;
+      }
+
+      await handleBarcode(attempt.result);
+    } finally {
+      setManualCapturing(false);
     }
-
-    await handleBarcode(attempt.result);
   }
 
   return (
     <div className="space-y-4">
       <div className="relative overflow-hidden rounded-md bg-gray-100">
         <video ref={videoRef} className="aspect-video w-full object-cover" muted playsInline />
-        <div className="pointer-events-none absolute inset-0 bg-black/20">
-          <div className="absolute left-1/2 top-1/2 h-[78%] w-[96%] -translate-x-1/2 -translate-y-1/2 rounded-md border-2 border-white shadow-[0_0_0_999px_rgba(0,0,0,0.3)]" />
-          <p className="absolute left-1/2 top-[14%] -translate-x-1/2 rounded-full bg-black/60 px-3 py-1 text-xs font-medium text-white">
+        <div className="pointer-events-none absolute inset-0 bg-gray-500/12">
+          <div className="absolute left-1/2 top-1/2 h-[78%] w-[96%] -translate-x-1/2 -translate-y-1/2 rounded-md border-2 border-white shadow-[0_0_0_999px_rgba(107,114,128,0.22)]" />
+          <p className="absolute left-1/2 top-[14%] -translate-x-1/2 rounded-full bg-gray-700/70 px-3 py-1 text-xs font-medium text-white">
             Keep the full card inside the box
           </p>
         </div>
@@ -219,7 +295,10 @@ export default function BarcodeScanner() {
             <select
               className="mt-1 w-full rounded-md border border-gray-300 bg-white px-3 py-2 text-gray-950"
               value={deviceId ?? ''}
-              onChange={(event) => setDeviceId(event.target.value)}
+              onPointerDown={pauseScannerForCameraPicker}
+              onFocus={pauseScannerForCameraPicker}
+              onBlur={resumeScannerAfterCameraPicker}
+              onChange={(event) => handleCameraChange(event.target.value)}
             >
               {devices.map((device, index) => (
                 <option key={device.deviceId} value={device.deviceId}>
@@ -236,8 +315,8 @@ export default function BarcodeScanner() {
           </Button>
         )}
 
-        <Button type="button" onClick={() => void captureBarcodeManually()} className="self-end">
-          Manual Capture
+        <Button type="button" onClick={() => void captureBarcodeManually()} disabled={manualCapturing} className="self-end">
+          {manualCapturing ? 'Capturing...' : 'Manual Capture'}
         </Button>
       </div>
 

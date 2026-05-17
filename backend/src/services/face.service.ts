@@ -20,6 +20,11 @@ export type FaceCompareResult = {
   threshold: number;
 };
 
+type CachedDescriptor = {
+  descriptor: Float32Array | null;
+  mtimeMs: number;
+};
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
 const backendRoot = path.resolve(__dirname, '../..');
@@ -30,8 +35,13 @@ const facesPath = path.join(storagePath, 'faces');
 const modelsPath = path.join(storagePath, 'models');
 const wasmPath = path.dirname(require.resolve('@tensorflow/tfjs-backend-wasm/dist/tfjs-backend-wasm.wasm'));
 const threshold = Number(process.env.FACE_MATCH_THRESHOLD ?? 0.6);
+const detectorOptions = new faceapi.TinyFaceDetectorOptions({
+  inputSize: 160,
+  scoreThreshold: 0.3
+});
 
 let modelsLoaded = false;
+const descriptorCache = new Map<string, CachedDescriptor>();
 
 async function loadModels() {
   if (modelsLoaded) return;
@@ -52,11 +62,25 @@ async function getDescriptorFromImage(input: string | Buffer) {
 
   const image = await loadImage(input);
   const detection = await faceapi
-    .detectSingleFace(image as unknown as faceapi.TNetInput, new faceapi.TinyFaceDetectorOptions())
+    .detectSingleFace(image as unknown as faceapi.TNetInput, detectorOptions)
     .withFaceLandmarks()
     .withFaceDescriptor();
 
   return detection?.descriptor ?? null;
+}
+
+async function getDescriptorFromFile(filePath: string) {
+  const stat = await fs.stat(filePath).catch(() => null);
+  if (!stat) return null;
+
+  const cached = descriptorCache.get(filePath);
+  if (cached && cached.mtimeMs === stat.mtimeMs) {
+    return cached.descriptor;
+  }
+
+  const descriptor = await getDescriptorFromImage(filePath);
+  descriptorCache.set(filePath, { descriptor, mtimeMs: stat.mtimeMs });
+  return descriptor;
 }
 
 function dataUrlToBuffer(dataUrl: string) {
@@ -76,7 +100,7 @@ export async function compareFaceWithDataset(cardFaceDataUrl: string): Promise<F
   let best: { name: string; distance: number } | null = null;
 
   for (const file of imageFiles) {
-    const descriptor = await getDescriptorFromImage(path.join(facesPath, file));
+    const descriptor = await getDescriptorFromFile(path.join(facesPath, file));
     if (!descriptor) continue;
 
     const distance = faceapi.euclideanDistance(queryDescriptor, descriptor);
